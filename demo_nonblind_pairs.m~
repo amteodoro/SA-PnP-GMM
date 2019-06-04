@@ -1,0 +1,170 @@
+% Image deblurring using image pairs
+
+% SALSA formulation
+
+clear
+close all
+
+experiment_number = 1;
+
+x=im2double(imread('Cameraman256.png'));
+
+
+orig = x;
+if experiment_number == 90;
+    [blurred, ~, ~, sigmab, hshift, h] = blurimage(orig, 90, filter);
+else
+    [blurred, ~, ~, sigmab, hshift, h] = blurimage(orig, experiment_number);
+end
+
+randn('seed',0)
+
+blurred = blurred + sigmab*randn(size(blurred));
+
+filter = h;
+
+psnr_y = PSNR(orig,blurred,1,0);
+iters = 50;
+update = inf;
+
+sigma = [25];
+
+randn('seed',0)
+runi = 0;
+noisy = orig + (sigma/255)*randn(size(orig));
+sigma_hat = sigma/255;
+
+figure(2), imshow(noisy), colormap gray, drawnow
+
+pd = 8;
+K = 20;
+ps = 1;
+
+% Training step using noisy image
+
+yy = wextend(2,'sym',noisy,[pd-1,pd-1]);
+
+patches = im2colstep(yy,[pd,pd],[ps,ps]);
+
+patches_dc=mean(patches);
+patches= bsxfun(@minus, patches , patches_dc);
+
+[prob,Scomp,Ucomp, ~,~, supportvar] = ...
+    EM_zeromean(patches,K,sigma_hat);
+
+database = {prob; Scomp; Ucomp; supportvar};
+filename = 'mix';
+save(filename, 'prob', 'Scomp', 'Ucomp', 'supportvar');
+% filename = 'berkeleypd6K20ps4';
+% filename = 'textpd6K20ps2';
+database = filename;
+isnr = [];
+
+[ze, PSNR3] = denoising('clean', orig, 'sigma', sigma, 'sub', 0, 'dis', 0, 'external', database);
+
+
+
+kerEst = 0;
+
+if kerEst == 1
+    [mKer] = calcKer(blurred, ze, size(filter));
+    mKer = max(mKer, 0);
+    mKer = mKer/(sum(mKer(:)));
+    
+    % Kernel estimation with ADMM
+    l_size = round((size(filter)-1)/2);
+    lx = l_size(1);     ly = l_size(2);
+    lx_conv = 0;
+    ly_conv = 0;
+    MT = @(x) padarray( padarray( x, lx_conv , 0 )' , ly_conv , 0 )';
+    MTy = MT(blurred);
+    
+    
+    [h] = findH_ADMM_UBC(blurred,fft2(blurred),MTy,ones(size(MTy)),ze,size(filter),2,0.5);
+    
+    ht =  h2ht( h , lx,ly );
+    
+    h = ht2h( ht , size(blurred,1),size(blurred,2) );
+    h0=h;
+    h = h/sum(sum(h(:)));
+    h1{1} = h2ht(h,lx,ly);
+    
+    [~, R, RT, ~, hshift1{1}, h1{1}] = blurimage(orig, 90, h1{1});
+    
+else
+    [~, R, RT, ~, hshift1{1}, h1{1}] = blurimage(orig, 90, h);
+end
+
+rhovec = 0.01;%[0.001 0.01 0.1 1 10];
+lambdavec = 0.0001;%[0.00001 0.0001 0.001 0.01 0.1];
+tauvec = 1;%[0.000001 0.00001 0.0001 0.001];
+v3 = ze;
+cont = 1;
+rep = 1;
+best_idx = inf;
+v3best = cell(0);
+psnr_best_rep = [];
+resultsAll = [];
+run = 1;
+
+
+
+count = 1;
+ze = v3;
+psnrv3 = [];
+psnrx = [];
+psnrv2 = [];
+rho = rhovec
+lambda = lambdavec
+tau = tauvec
+best_psnr = -inf;
+fprintf('Parameters - rho: %f; \t lambda: %f; \t tau: %f;\n', run, length(rhovec)*length(lambdavec)*length(tauvec), rho, lambda, tau)
+
+H_FFT = fft2(hshift1{rep});
+H2 = abs(H_FFT).^2;
+filter_FFT = H2./(H2 + (rho) + lambda);
+invLS = @(x, mu, filter_FFT) (1/mu)*( x - real( ifft2( filter_FFT.*fft2( x ) ) ) );
+
+iter = 20;
+x0 =  zeros(size(ze));
+for i = 1:iter
+    if i == 1 % Initializations
+        x = x0;
+        v1 = x;
+        v2 = x;
+        v3 = x;
+        d1 = 0;
+        d2 = 0;
+        d3 = 0;
+        y1 = noisy;
+        y2 = blurred;
+        RTy = RT(y2);
+    end
+    
+    r = RTy + rho*(v3 + d3) + lambda*y1;
+    x = invLS(r, rho + lambda, filter_FFT);
+    
+    auxim = x-d3;
+    sigma_hat = NoiseEstimation(auxim, 8);
+    if sigma_hat < 2/255
+        sigma_hat = 2/255;
+    end
+    
+    [v3, ~] = denmix(auxim, orig, sigma_hat, database, 1);
+    
+    d3 = d3 - (x - v3);
+    psnrv3(count, i) = PSNR(orig, v3, 1, 0);
+    
+    if psnrv3(count, i) > best_psnr
+        best_psnr = psnrv3(count, i);
+        best_i = i;
+    end
+    if ~mod(i,5) || i == 1
+        psnrx(count, i) = PSNR(orig, x, 1, 0);
+        psnrv2(count, i) = 1;%PSNR(orig, v2, 1, 0);
+        fprintf('Iteration number: %d; \t PSNR v3: %4.2f; \t PSNR x: %4.2f; \t PSNR v2: %4.2f; \t ISNR: %4.2f\n', i, psnrv3(count, i), psnrx(count, i), psnrv2(count, i), psnrv3(count, i) - psnr_y)
+    end
+end
+
+
+
